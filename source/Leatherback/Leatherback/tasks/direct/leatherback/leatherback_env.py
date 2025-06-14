@@ -2,220 +2,187 @@ from __future__ import annotations
 
 import torch
 from collections.abc import Sequence
+import os
+
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, ArticulationCfg
-from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
+from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-from .waypoint import WAYPOINT_CFG
-from .leatherback import LEATHERBACK_CFG
-from isaaclab.markers import VisualizationMarkers
+
+from .leatherback import LEATHERBACK_1_CFG, LEATHERBACK_2_CFG
 
 @configclass
-class LeatherbackEnvCfg(DirectRLEnvCfg):
+class LeatherbackSumoEnvCfg(DirectMARLEnvCfg):
+    # Path to the pre-built USD stage for the sumo environment
+    # This path is relative to the leatherback_env.py file
+    usd_path = "custom_assets/sumo_leatherback.usd"
+
     decimation = 4
-    episode_length_s = 20.0
+    episode_length_s = 30.0
     action_space = 2
-    observation_space = 8
+    observation_space = 10 # rel_pos (2), rel_heading (2), own_vel (3), opponent_vel (3) = 10
     state_space = 0
     sim: SimulationCfg = SimulationCfg(dt=1 / 60, render_interval=decimation)
-    robot_cfg: ArticulationCfg = LEATHERBACK_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    waypoint_cfg = WAYPOINT_CFG
 
-    throttle_dof_name = [
-        "Wheel__Knuckle__Front_Left",
-        "Wheel__Knuckle__Front_Right",
-        "Wheel__Upright__Rear_Right",
-        "Wheel__Upright__Rear_Left"
-    ]
-    steering_dof_name = [
-        "Knuckle__Upright__Front_Right",
-        "Knuckle__Upright__Front_Left",
-    ]
+    # Define agent groups for the two robots
+    agent_groups = ["leatherback_1", "leatherback_2"]
+    # Assign the articulation assets to the agent groups
+    asset_groups = {"leatherback_1": ["robot_1"], "leatherback_2": ["robot_2"]}
 
-    env_spacing = 32.0
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=env_spacing, replicate_physics=True)
+    # Define the articulation assets by pointing to prims in the USD
+    robot_1: ArticulationCfg = LEATHERBACK_1_CFG.replace(prim_path="/World/envs/env_.*/leatherback")
+    robot_2: ArticulationCfg = LEATHERBACK_2_CFG.replace(prim_path="/World/envs/env_.*/leatherback2")
 
-class LeatherbackEnv(DirectRLEnv):
-    cfg: LeatherbackEnvCfg
+    # Define the dohyo border prim path from your USD
+    dohyo_border_prim_path = "/World/envs/env_.*/Dohyo/WhiteBorder"
 
-    def __init__(self, cfg: LeatherbackEnvCfg, render_mode: str | None = None, **kwargs):
+    # Scene configuration
+    env_spacing = 5.0
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=1024, env_spacing=env_spacing, replicate_physics=True
+    )
+
+
+class LeatherbackEnv(DirectMARLEnv):
+    cfg: LeatherbackSumoEnvCfg
+
+    def __init__(self, cfg: LeatherbackSumoEnvCfg, render_mode: str | None = None, **kwargs):
+        # Resolve the full path to the USD file
+        self.cfg.usd_path = os.path.join(os.path.dirname(__file__), self.cfg.usd_path)
         super().__init__(cfg, render_mode, **kwargs)
-        self._throttle_dof_idx, _ = self.leatherback.find_joints(self.cfg.throttle_dof_name)
-        self._steering_dof_idx, _ = self.leatherback.find_joints(self.cfg.steering_dof_name)
-        self._throttle_state = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)
-        self._steering_state = torch.zeros((self.num_envs,2), device=self.device, dtype=torch.float32)
-        self._goal_reached = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
-        self.task_completed = torch.zeros((self.num_envs), device=self.device, dtype=torch.bool)
-        self._num_goals = 10
-        self._target_positions = torch.zeros((self.num_envs, self._num_goals, 2), device=self.device, dtype=torch.float32)
-        self._markers_pos = torch.zeros((self.num_envs, self._num_goals, 3), device=self.device, dtype=torch.float32)
-        self.env_spacing = self.cfg.env_spacing
-        self.course_length_coefficient = 2.5
-        self.course_width_coefficient = 2.0
-        self.position_tolerance = 0.15
-        self.goal_reached_bonus = 10.0
-        self.position_progress_weight = 1.0
-        self.heading_coefficient = 0.25
-        self.heading_progress_weight = 0.05
-        self._target_index = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
+
+        # Agent-specific information
+        self.robot1_map = self.agent_manager.get_agent_indices("leatherback_1")
+        self.robot2_map = self.agent_manager.get_agent_indices("leatherback_2")
+
+        # Environment parameters
+        self.dohyo_radius = 1.5  # Adjust if your dohyo radius is different
+        self.win_reward = 100.0
+        self.lose_penalty = -100.0
+        self.push_reward = 1.0
+        self.alive_reward = 0.1
 
     def _setup_scene(self):
-        # Create a large ground plane without grid
-        spawn_ground_plane(
-            prim_path="/World/ground",
-            cfg=GroundPlaneCfg(
-                size=(500.0, 500.0),  # Much larger ground plane (500m x 500m)
-                color=(0.2, 0.2, 0.2),  # Dark gray color
-                physics_material=sim_utils.RigidBodyMaterialCfg(
-                    friction_combine_mode="multiply",
-                    restitution_combine_mode="multiply",
-                    static_friction=1.0,
-                    dynamic_friction=1.0,
-                    restitution=0.0,
-                ),
-            ),
+        # -- Load the entire stage from the specified USD file
+        sim_utils.open_usd(self.cfg.usd_path)
+
+        # -- Get handles to the assets defined in the USD
+        self.robot_1 = Articulation(self.cfg.robot_1)
+        self.robot_2 = Articulation(self.cfg.robot_2)
+        self.dohyo_border = RigidObject(
+            RigidObjectCfg(prim_path=self.cfg.dohyo_border_prim_path)
         )
 
-        # Setup rest of the scene
-        self.leatherback = Articulation(self.cfg.robot_cfg)
-        self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
-        self.object_state = []
-        
-        self.scene.clone_environments(copy_from_source=False)
-        self.scene.filter_collisions(global_prim_paths=[])
-        self.scene.articulations["leatherback"] = self.leatherback
+        # -- Clone environments and add assets to the scene
+        # We set copy_from_source=True because the source (/World/Dohyo, /World/leatherback, etc.)
+        # now comes from the loaded USD file.
+        self.scene.clone_environments(copy_from_source=True)
+        self.scene.articulations["robot_1"] = self.robot_1
+        self.scene.articulations["robot_2"] = self.robot_2
+        self.scene.rigid_objects["dohyo_border"] = self.dohyo_border
 
-        # Add lighting
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-        light_cfg.func("/World/Light", light_cfg)
+    def _pre_physics_step(self, actions: dict[str, torch.Tensor]):
+        # Actions are dictionaries with agent groups as keys
+        actions_robot1 = actions["leatherback_1"]
+        actions_robot2 = actions["leatherback_2"]
 
-    def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        throttle_scale = 10
-        throttle_max = 50
-        steering_scale = 0.1
-        steering_max = 0.75
+        # Apply actions to robot 1
+        self.robot_1.set_joint_velocity_target(actions_robot1[:, 0].repeat(1,4), joint_regex="Wheel.*")
+        self.robot_1.set_joint_position_target(actions_robot1[:, 1].repeat(1,2), joint_regex="Knuckle.*")
 
-        self._throttle_action = actions[:, 0].repeat_interleave(4).reshape((-1, 4)) * throttle_scale
-        self.throttle_action = torch.clamp(self._throttle_action, -throttle_max, throttle_max)
-        self._throttle_state = self._throttle_action
-        
-        self._steering_action = actions[:, 1].repeat_interleave(2).reshape((-1, 2)) * steering_scale
-        self._steering_action = torch.clamp(self._steering_action, -steering_max, steering_max)
-        self._steering_state = self._steering_action
+        # Apply actions to robot 2
+        self.robot_2.set_joint_velocity_target(actions_robot2[:, 0].repeat(1,4), joint_regex="Wheel.*")
+        self.robot_2.set_joint_position_target(actions_robot2[:, 1].repeat(1,2), joint_regex="Knuckle.*")
 
-    def _apply_action(self) -> None:
-        self.leatherback.set_joint_velocity_target(self._throttle_action, joint_ids=self._throttle_dof_idx)
-        self.leatherback.set_joint_position_target(self._steering_state, joint_ids=self._steering_dof_idx)
+    def _get_observations(self) -> dict[str, dict[str, torch.Tensor]]:
+        # Observations for Robot 1
+        pos_1 = self.robot_1.data.root_pos_w
+        pos_2 = self.robot_2.data.root_pos_w
+        relative_pos_to_2 = pos_2 - pos_1
+        obs_robot1 = torch.cat([
+            relative_pos_to_2[:, :2],
+            torch.cos(self.robot_1.data.heading_w).unsqueeze(1),
+            torch.sin(self.robot_1.data.heading_w).unsqueeze(1),
+            self.robot_1.data.root_lin_vel_b,
+            self.robot_2.data.root_lin_vel_b
+        ], dim=-1)
 
-    def _get_observations(self) -> dict:
-        current_target_positions = self._target_positions[self.leatherback._ALL_INDICES, self._target_index]
-        self._position_error_vector = current_target_positions - self.leatherback.data.root_pos_w[:, :2]
-        self._previous_position_error = self._position_error.clone()
-        self._position_error = torch.norm(self._position_error_vector, dim=-1)
+        # Observations for Robot 2
+        relative_pos_to_1 = pos_1 - pos_2
+        obs_robot2 = torch.cat([
+            relative_pos_to_1[:, :2],
+            torch.cos(self.robot_2.data.heading_w).unsqueeze(1),
+            torch.sin(self.robot_2.data.heading_w).unsqueeze(1),
+            self.robot_2.data.root_lin_vel_b,
+            self.robot_1.data.root_lin_vel_b
+        ], dim=-1)
 
-        heading = self.leatherback.data.heading_w
-        target_heading_w = torch.atan2(
-            self._target_positions[self.leatherback._ALL_INDICES, self._target_index, 1] - self.leatherback.data.root_link_pos_w[:, 1],
-            self._target_positions[self.leatherback._ALL_INDICES, self._target_index, 0] - self.leatherback.data.root_link_pos_w[:, 0],
-        )
-        self.target_heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
+        return {
+            "leatherback_1": {"policy": obs_robot1},
+            "leatherback_2": {"policy": obs_robot2},
+        }
 
-        obs = torch.cat(
-            (
-                self._position_error.unsqueeze(dim=1),
-                torch.cos(self.target_heading_error).unsqueeze(dim=1),
-                torch.sin(self.target_heading_error).unsqueeze(dim=1),
-                self.leatherback.data.root_lin_vel_b[:, 0].unsqueeze(dim=1),
-                self.leatherback.data.root_lin_vel_b[:, 1].unsqueeze(dim=1),
-                self.leatherback.data.root_ang_vel_w[:, 2].unsqueeze(dim=1),
-                self._throttle_state[:, 0].unsqueeze(dim=1),
-                self._steering_state[:, 0].unsqueeze(dim=1),
-            ),
-            dim=-1,
-        )
-        
-        if torch.any(obs.isnan()):
-            raise ValueError("Observations cannot be NAN")
+    def _get_rewards(self) -> dict[str, torch.Tensor]:
+        pos_1 = self.robot_1.data.root_pos_w
+        pos_2 = self.robot_2.data.root_pos_w
+        dist_from_center_1 = torch.norm(pos_1[:, :2] - self.scene.env_origins[:,:2], dim=1)
+        dist_from_center_2 = torch.norm(pos_2[:, :2] - self.scene.env_origins[:,:2], dim=1)
 
-        return {"policy": obs}
-    
-    def _get_rewards(self) -> torch.Tensor:
-        position_progress_rew = self._previous_position_error - self._position_error
-        target_heading_rew = torch.exp(-torch.abs(self.target_heading_error) / self.heading_coefficient)
-        goal_reached = self._position_error < self.position_tolerance
-        self._target_index = self._target_index + goal_reached
-        self.task_completed = self._target_index > (self._num_goals -1)
-        self._target_index = self._target_index % self._num_goals
+        robot1_out = (dist_from_center_1 > self.dohyo_radius)
+        robot2_out = (dist_from_center_2 > self.dohyo_radius)
 
-        composite_reward = (
-            position_progress_rew * self.position_progress_weight +
-            target_heading_rew * self.heading_progress_weight +
-            goal_reached * self.goal_reached_bonus
-        )
+        rewards_1 = torch.full_like(dist_from_center_1, self.alive_reward)
+        rewards_2 = torch.full_like(dist_from_center_2, self.alive_reward)
 
-        one_hot_encoded = torch.nn.functional.one_hot(self._target_index.long(), num_classes=self._num_goals)
-        marker_indices = one_hot_encoded.view(-1).tolist()
-        self.waypoints.visualize(marker_indices=marker_indices)
+        rewards_1 += torch.where(robot2_out & ~robot1_out, self.win_reward, 0.0)
+        rewards_2 += torch.where(robot1_out & ~robot2_out, self.win_reward, 0.0)
+        rewards_1 += torch.where(robot1_out, self.lose_penalty, 0.0)
+        rewards_2 += torch.where(robot2_out, self.lose_penalty, 0.0)
 
-        if torch.any(composite_reward.isnan()):
-            raise ValueError("Rewards cannot be NAN")
+        rewards_1 += self.push_reward * (dist_from_center_2 / self.dohyo_radius)
+        rewards_2 += self.push_reward * (dist_from_center_1 / self.dohyo_radius)
 
-        return composite_reward
+        return {"leatherback_1": rewards_1, "leatherback_2": rewards_2}
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        task_failed = self.episode_length_buf > self.max_episode_length
-        return task_failed, self.task_completed
+        pos_1 = self.robot_1.data.root_pos_w
+        pos_2 = self.robot_2.data.root_pos_w
+        dist_from_center_1 = torch.norm(pos_1[:, :2] - self.scene.env_origins[:,:2], dim=1)
+        dist_from_center_2 = torch.norm(pos_2[:, :2] - self.scene.env_origins[:,:2], dim=1)
 
-    def _reset_idx(self, env_ids: Sequence[int] | None):
-        if env_ids is None:
-            env_ids = self.leatherback._ALL_INDICES
-        super()._reset_idx(env_ids)
+        robot1_out = (dist_from_center_1 > self.dohyo_radius)
+        robot2_out = (dist_from_center_2 > self.dohyo_radius)
+        time_out = self.episode_length_buf >= self.max_episode_length
 
-        num_reset = len(env_ids)
-        default_state = self.leatherback.data.default_root_state[env_ids]
-        leatherback_pose = default_state[:, :7]
-        leatherback_velocities = default_state[:, 7:]
-        joint_positions = self.leatherback.data.default_joint_pos[env_ids]
-        joint_velocities = self.leatherback.data.default_joint_vel[env_ids]
+        dones = robot1_out | robot2_out | time_out
+        return dones, dones
 
-        leatherback_pose[:, :3] += self.scene.env_origins[env_ids]
-        leatherback_pose[:, 0] -= self.env_spacing / 2
-        leatherback_pose[:, 1] += 2.0 * torch.rand((num_reset), dtype=torch.float32, device=self.device) * self.course_width_coefficient
+    def _reset_idx(self, env_ids: Sequence[int]):
+        if len(env_ids) == 0:
+            return
+        
+        # Define initial root states for reset
+        # Robot 1 starts at (0, 0.5, z)
+        root_state_1 = self.robot_1.data.default_root_state[env_ids]
+        root_state_1[:, 1] = 0.5
+        root_state_1[:, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device) # Reset orientation
+        
+        # Robot 2 starts at (0, -0.5, z)
+        root_state_2 = self.robot_2.data.default_root_state[env_ids]
+        root_state_2[:, 1] = -0.5
+        root_state_2[:, 3:7] = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device) # Reset orientation (180 deg turn)
 
-        angles = torch.pi / 6.0 * torch.rand((num_reset), dtype=torch.float32, device=self.device)
-        leatherback_pose[:, 3] = torch.cos(angles * 0.5)
-        leatherback_pose[:, 6] = torch.sin(angles * 0.5)
+        # Write reset states to the simulation
+        self.robot_1.write_root_state_to_sim(root_state_1, env_ids)
+        self.robot_2.write_root_state_to_sim(root_state_2, env_ids)
+        
+        # Reset joint states
+        default_joint_pos = self.robot_1.data.default_joint_pos[env_ids]
+        default_joint_vel = self.robot_1.data.default_joint_vel[env_ids]
+        self.robot_1.write_joint_state_to_sim(default_joint_pos, default_joint_vel, env_ids=env_ids)
+        self.robot_2.write_joint_state_to_sim(default_joint_pos, default_joint_vel, env_ids=env_ids)
 
-        self.leatherback.write_root_pose_to_sim(leatherback_pose, env_ids)
-        self.leatherback.write_root_velocity_to_sim(leatherback_velocities, env_ids)
-        self.leatherback.write_joint_state_to_sim(joint_positions, joint_velocities, None, env_ids)
-
-        self._target_positions[env_ids, :, :] = 0.0
-        self._markers_pos[env_ids, :, :] = 0.0
-
-        spacing = 2 / self._num_goals
-        target_positions = torch.arange(-0.8, 1.1, spacing, device=self.device) * self.env_spacing / self.course_length_coefficient
-        self._target_positions[env_ids, :len(target_positions), 0] = target_positions
-        self._target_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) + self.course_length_coefficient
-        self._target_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
-
-        self._target_index[env_ids] = 0
-        self._markers_pos[env_ids, :, :2] = self._target_positions[env_ids]
-        visualize_pos = self._markers_pos.view(-1, 3)
-        self.waypoints.visualize(translations=visualize_pos)
-
-        current_target_positions = self._target_positions[self.leatherback._ALL_INDICES, self._target_index]
-        self._position_error_vector = current_target_positions[:, :2] - self.leatherback.data.root_pos_w[:, :2]
-        self._position_error = torch.norm(self._position_error_vector, dim=-1)
-        self._previous_position_error = self._position_error.clone()
-
-        heading = self.leatherback.data.heading_w[:]
-        target_heading_w = torch.atan2( 
-            self._target_positions[:, 0, 1] - self.leatherback.data.root_pos_w[:, 1],
-            self._target_positions[:, 0, 0] - self.leatherback.data.root_pos_w[:, 0],
-        )
-        self._heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
-        self._previous_heading_error = self._heading_error.clone()
+        # Reset episode timer
+        self.episode_length_buf[env_ids] = 0
