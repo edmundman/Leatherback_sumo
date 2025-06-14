@@ -3,13 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Configuration for the leatherback robot."""
+"""Configuration for the leatherback robot in the sumo task."""
 
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
 # Define a base configuration that only contains the actuators.
-# The spawn and init_state info is now handled by the main USD file.
+# The spawn and init_state info is handled by the main USD file and environment.
 BASE_LEATHERBACK_CFG = ArticulationCfg(
     actuators={
         "throttle": ImplicitActuatorCfg(
