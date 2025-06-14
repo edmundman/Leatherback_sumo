@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Installation script for the 'Leatherback' python package."""
+"""Installation script for the 'LeatherbackSumo' python package."""
 
 import os
 import toml
@@ -23,13 +23,13 @@ INSTALL_REQUIRES = [
 
 # Installation operation
 setup(
-    name="Leatherback",
+    name="LeatherbackSumo", 
     packages=["Leatherback"],
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],
     version=EXTENSION_TOML_DATA["package"]["version"],
-    description=EXTENSION_TOML_DATA["package"]["description"],
+    description="A multi-agent sumo wrestling task for Isaac Lab.", # Updated description
     keywords=EXTENSION_TOML_DATA["package"]["keywords"],
     install_requires=INSTALL_REQUIRES,
     license="MIT",
